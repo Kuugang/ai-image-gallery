@@ -73,3 +73,29 @@ def token(super_client: Client) -> Generator[Token, None]:
         {"email": fake.email(), "password": "testpassword123"}
     )
     yield Token(access_token=response.session.access_token)
+
+
+@pytest.fixture(scope="function")
+def test_user_email() -> str:
+    return fake.email()
+
+
+@pytest.fixture(scope="function")
+def test_user_password() -> str:
+    return "testpassword123"
+
+
+@pytest.fixture(scope="function")
+def test_access_token(super_client: Client, test_user_email: str, test_user_password: str) -> str:
+    response = super_client.auth.sign_up(
+        {"email": test_user_email, "password": test_user_password}
+    )
+    return response.session.access_token
+
+
+@pytest.fixture(scope="function")
+def test_refresh_token(super_client: Client, test_user_email: str, test_user_password: str) -> str:
+    response = super_client.auth.sign_up(
+        {"email": test_user_email, "password": test_user_password}
+    )
+    return response.session.refresh_token
