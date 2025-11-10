@@ -1,14 +1,14 @@
 import logging
-import os
-from uuid import UUID, uuid4
 from pathlib import Path
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from sqlmodel import select
 
-from app.api.deps import CurrentUser, SessionDep, SuperClient
-from app.models.image import Image, ImagePublic, ImagesPublic
+from app.api.deps import CurrentUser, SessionDep, SuperClient, everypixel
 from app.core.config import settings
+from app.models.image import Image, ImagePublic, ImagesPublic
+from app.models.image_metadata import ImageMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ async def upload_image(
 ) -> ImagePublic:
     """
     Upload an image to Supabase Storage and create image record.
-    
+
     - **file**: Image file (JPG, PNG, GIF, WebP)
     - Returns: ImagePublic with upload details
     """
@@ -51,7 +51,7 @@ async def upload_image(
 
         # Create unique file path
         file_id = str(UUID(user.id))
-        
+
         # Generate unique filename to avoid conflicts
         # Format: {original_name_without_ext}_{uuid4}.{ext}
         file_path_obj = Path(file.filename)
@@ -73,13 +73,25 @@ async def upload_image(
                 detail="Failed to upload file to storage",
             )
 
+        res = await client.storage.from_("images").create_signed_url(file_path, 600)
+        signed_url = res["signedURL"]
+
+        keywording_data = await everypixel.keywords_by_url(
+            signed_url,
+            num_keywords=5,
+            colors=True,
+            num_colors=3,
+            lang="en",
+        )
+
+        captioning_data = await everypixel.captions_by_url(signed_url)
+
         # Create database record
         db_image = Image(
             filename=file.filename,
             original_path=file_path,
-            thumbnail_path=None,  # Generate thumbnail asynchronously
+            thumbnail_path=None,
             user_id=UUID(user.id),
-            owner_id=UUID(user.id),
         )
 
         session.add(db_image)
@@ -87,6 +99,43 @@ async def upload_image(
         session.refresh(db_image)
 
         logger.info(f"Image record created: {db_image.id}")
+
+        # Extract keywords and colors from EveryPixel API response
+        keywords = []
+        colors_hex = []
+        caption = None
+
+        if keywording_data and keywording_data.get("status") == "ok":
+            # Extract keywords
+            if keywording_data.get("keywords"):
+                keywords = [kw["keyword"] for kw in keywording_data["keywords"]]
+
+            # Extract color hex values
+            if keywording_data.get("colors"):
+                colors_hex = [color["hex"] for color in keywording_data["colors"]]
+
+            logger.info(
+                f"Extracted {len(keywords)} keywords and {len(colors_hex)} colors"
+            )
+
+        if captioning_data and captioning_data.get("status") == True:
+            caption = captioning_data["result"]["caption"]
+            logger.info(f"Extracted caption data for image")
+
+        db_metadata = ImageMetadata(
+            image_id=db_image.id,
+            user_id=UUID(user.id),
+            description=caption,
+            tags=keywords,
+            colors=colors_hex,
+            ai_processing_status="completed",
+        )
+
+        session.add(db_metadata)
+        session.commit()
+        session.refresh(db_metadata)
+
+        logger.info(f"Image metadata created: {db_metadata.id}")
 
         return ImagePublic(
             id=db_image.id,
@@ -114,7 +163,7 @@ async def get_image(
 ) -> ImagePublic:
     """
     Get image details by ID.
-    
+
     - **image_id**: Image UUID
     """
     try:
@@ -155,7 +204,7 @@ async def list_images(
 ) -> ImagesPublic:
     """
     List all images for current user.
-    
+
     - **skip**: Number of images to skip
     - **limit**: Maximum number of images to return
     """
@@ -205,7 +254,7 @@ async def download_image(
 ):
     """
     Download an image file from storage.
-    
+
     - **image_id**: Image UUID
     - Returns: File download
     """
@@ -264,7 +313,7 @@ async def delete_image(
 ) -> None:
     """
     Delete an image and remove from storage.
-    
+
     - **image_id**: Image UUID
     """
     try:
@@ -316,7 +365,7 @@ async def get_public_url(
 ) -> dict[str, str]:
     """
     Get public URL for an image (if bucket is public).
-    
+
     - **image_id**: Image UUID
     - Returns: Public URL to the image
     """
