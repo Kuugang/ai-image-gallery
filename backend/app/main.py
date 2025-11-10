@@ -60,9 +60,9 @@ def timestamp_log_config(uvicorn_log_config: dict[str, Any]) -> dict[str, Any]:
     datefmt = "%d-%m-%Y %H:%M:%S"
     formatters = uvicorn_log_config["formatters"]
     formatters["default"]["fmt"] = "%(levelprefix)s [%(asctime)s] %(message)s"
-    formatters["access"]["fmt"] = (
-        '%(levelprefix)s [%(asctime)s] %(client_addr)s - "%(request_line)s" %(status_code)s'
-    )
+    formatters["access"][
+        "fmt"
+    ] = '%(levelprefix)s [%(asctime)s] %(client_addr)s - "%(request_line)s" %(status_code)s'
     formatters["access"]["datefmt"] = datefmt
     formatters["default"]["datefmt"] = datefmt
     return uvicorn_log_config
