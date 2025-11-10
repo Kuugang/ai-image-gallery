@@ -28,6 +28,17 @@ target_metadata = SQLModel.metadata
 # ... etc.
 
 
+def include_object(object, name, type_, reflected, compare_to):
+    """
+    Should you include this table or not?
+    """
+    if type_ == "table":
+        # Skip tables marked with skip_autogenerate
+        if object.info.get("skip_autogenerate", False):
+            return False
+    return True
+
+
 def get_url() -> str:
     url = str(settings.SQLALCHEMY_DATABASE_URI)
     return url.replace("postgresql+asyncpg://", "postgresql://")
@@ -52,6 +63,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         compare_type=True,
         dialect_opts={"paramstyle": "named"},
+        include_object=include_object,
     )
 
     with context.begin_transaction():
