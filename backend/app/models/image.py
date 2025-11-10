@@ -27,9 +27,6 @@ class ImageUpdate(ImageBase):
 # Database model
 class Image(InDBBase, ImageBase, table=True):
     __tablename__ = "images"
-    user_id: uuid.UUID = Field(
-        foreign_key="auth.users.id", nullable=False, ondelete="CASCADE"
-    )
     uploaded_at: datetime = Field(default_factory=datetime.utcnow)
 
 
