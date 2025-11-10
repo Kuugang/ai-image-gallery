@@ -29,13 +29,8 @@ target_metadata = SQLModel.metadata
 
 
 def include_object(object, name, type_, reflected, compare_to):
-    """
-    Should you include this table or not?
-    """
-    if type_ == "table":
-        # Skip tables marked with skip_autogenerate
-        if object.info.get("skip_autogenerate", False):
-            return False
+    if type_ == "table" and getattr(object, "schema", None) == "auth":
+        return False
     return True
 
 

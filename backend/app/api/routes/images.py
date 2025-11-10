@@ -2,13 +2,22 @@ import logging
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile, status
 from sqlmodel import select
 
-from app.api.deps import CurrentUser, SessionDep, SuperClient, everypixel
+from app.api.deps import CurrentUser, SessionDep, SuperClient
 from app.core.config import settings
-from app.models.image import Image, ImagePublic, ImagesPublic
+from app.models.image import Image
 from app.models.image_metadata import ImageMetadata
+from app.models.image_colors import ImageColor
+from app.models.image_tags import ImageTag
+from app.schemas.image import (
+    ImageMetadataResponse,
+    ImagePublicResponse,
+    ImageUploadResponse,
+    ImagesListResponse,
+)
+from app.services.background_tasks import process_image_async
 
 logger = logging.getLogger(__name__)
 
@@ -19,18 +28,39 @@ BUCKET_NAME = "images"
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 
-@router.post("/upload", response_model=ImagePublic, status_code=status.HTTP_201_CREATED)
+def get_image_tags_and_colors(session: any, image_id: UUID) -> tuple[list[str], list[str]]:
+    """
+    Fetch tags and colors for an image from relationship tables.
+
+    Returns: (tags, colors) tuples
+    """
+    # Fetch tags
+    tags_statement = select(ImageTag).where(ImageTag.image_id == str(image_id))
+    image_tags = session.exec(tags_statement).all()
+    tags = [tag.tag_name for tag in image_tags]
+
+    # Fetch colors
+    colors_statement = select(ImageColor).where(ImageColor.image_id == str(image_id))
+    image_colors = session.exec(colors_statement).all()
+    colors = [color.color_hex for color in image_colors]
+
+    return tags, colors
+
+
+@router.post("/upload", response_model=ImageUploadResponse, status_code=status.HTTP_201_CREATED)
 async def upload_image(
     user: CurrentUser,
     session: SessionDep,
     client: SuperClient,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-) -> ImagePublic:
+) -> ImageUploadResponse:
     """
-    Upload an image to Supabase Storage and create image record.
+    Upload an image to Supabase Storage.
 
     - **file**: Image file (JPG, PNG, GIF, WebP)
-    - Returns: ImagePublic with upload details
+    - Returns: ImageUploadResponse with upload details
+    - AI processing happens in background (don't block upload)
     """
     try:
         # Validate file type
@@ -73,19 +103,6 @@ async def upload_image(
                 detail="Failed to upload file to storage",
             )
 
-        res = await client.storage.from_("images").create_signed_url(file_path, 600)
-        signed_url = res["signedURL"]
-
-        keywording_data = await everypixel.keywords_by_url(
-            signed_url,
-            num_keywords=5,
-            colors=True,
-            num_colors=3,
-            lang="en",
-        )
-
-        captioning_data = await everypixel.captions_by_url(signed_url)
-
         # Create database record
         db_image = Image(
             filename=file.filename,
@@ -100,50 +117,45 @@ async def upload_image(
 
         logger.info(f"Image record created: {db_image.id}")
 
-        # Extract keywords and colors from EveryPixel API response
-        keywords = []
-        colors_hex = []
-        caption = None
-
-        if keywording_data and keywording_data.get("status") == "ok":
-            # Extract keywords
-            if keywording_data.get("keywords"):
-                keywords = [kw["keyword"] for kw in keywording_data["keywords"]]
-
-            # Extract color hex values
-            if keywording_data.get("colors"):
-                colors_hex = [color["hex"] for color in keywording_data["colors"]]
-
-            logger.info(
-                f"Extracted {len(keywords)} keywords and {len(colors_hex)} colors"
-            )
-
-        if captioning_data and captioning_data.get("status") == True:
-            caption = captioning_data["result"]["caption"]
-            logger.info(f"Extracted caption data for image")
-
+        # Create initial metadata record with "pending" status
         db_metadata = ImageMetadata(
             image_id=db_image.id,
             user_id=UUID(user.id),
-            description=caption,
-            tags=keywords,
-            colors=colors_hex,
-            ai_processing_status="completed",
+            ai_processing_status="pending",
         )
 
         session.add(db_metadata)
         session.commit()
         session.refresh(db_metadata)
 
-        logger.info(f"Image metadata created: {db_metadata.id}")
+        logger.info(f"Image metadata created: {db_metadata.id} with status=pending")
 
-        return ImagePublic(
+        # Schedule async image processing in background
+        # Don't wait for it - return immediately to user
+        try:
+            res = await client.storage.from_("images").create_signed_url(file_path, 600)
+            signed_url = res["signedURL"]
+
+            background_tasks.add_task(
+                process_image_async,
+                image_id=db_image.id,
+                file_path=file_path,
+                user_id=UUID(user.id),
+                signed_url=signed_url,
+            )
+            logger.info(f"Scheduled async processing for image {db_image.id}")
+
+        except Exception as e:
+            logger.warning(f"Could not schedule AI processing: {str(e)}")
+            # Continue anyway - image is uploaded, just won't have AI metadata
+
+        return ImageUploadResponse(
             id=db_image.id,
             filename=db_image.filename,
             original_path=db_image.original_path,
-            thumbnail_path=db_image.thumbnail_path,
             user_id=db_image.user_id,
             uploaded_at=db_image.uploaded_at,
+            ai_processing_status="pending",
         )
 
     except HTTPException:
@@ -156,13 +168,13 @@ async def upload_image(
         )
 
 
-@router.get("/{image_id}", response_model=ImagePublic)
+@router.get("/{image_id}", response_model=ImageMetadataResponse)
 async def get_image(
     image_id: str,
     session: SessionDep,
-) -> ImagePublic:
+) -> ImageMetadataResponse:
     """
-    Get image details by ID.
+    Get image details by ID with AI metadata.
 
     - **image_id**: Image UUID
     """
@@ -176,13 +188,28 @@ async def get_image(
                 detail="Image not found",
             )
 
-        return ImagePublic(
+        # Get metadata
+        meta_statement = select(ImageMetadata).where(
+            ImageMetadata.image_id == UUID(image_id)
+        )
+        db_metadata = session.exec(meta_statement).first()
+
+        # Get tags and colors
+        tags, colors = get_image_tags_and_colors(session, UUID(image_id))
+
+        return ImageMetadataResponse(
             id=db_image.id,
             filename=db_image.filename,
             original_path=db_image.original_path,
             thumbnail_path=db_image.thumbnail_path,
             user_id=db_image.user_id,
             uploaded_at=db_image.uploaded_at,
+            description=db_metadata.description if db_metadata else None,
+            tags=tags if tags else None,
+            colors=colors if colors else None,
+            tag_vec=db_metadata.tag_vec if db_metadata else None,
+            color_vec=db_metadata.color_vec if db_metadata else None,
+            ai_processing_status=db_metadata.ai_processing_status if db_metadata else "pending",
         )
 
     except HTTPException:
@@ -195,15 +222,15 @@ async def get_image(
         )
 
 
-@router.get("", response_model=ImagesPublic)
+@router.get("", response_model=ImagesListResponse)
 async def list_images(
     user: CurrentUser,
     session: SessionDep,
     skip: int = 0,
     limit: int = 100,
-) -> ImagesPublic:
+) -> ImagesListResponse:
     """
-    List all images for current user.
+    List all images for current user with pagination.
 
     - **skip**: Number of images to skip
     - **limit**: Maximum number of images to return
@@ -211,7 +238,8 @@ async def list_images(
     try:
         # Get total count
         count_statement = select(Image).where(Image.user_id == UUID(user.id))
-        total_count = len(session.exec(count_statement).all())
+        all_images = session.exec(count_statement).all()
+        total_count = len(all_images)
 
         # Get paginated results
         statement = (
@@ -223,19 +251,42 @@ async def list_images(
         )
         db_images = session.exec(statement).all()
 
-        images = [
-            ImagePublic(
-                id=img.id,
-                filename=img.filename,
-                original_path=img.original_path,
-                thumbnail_path=img.thumbnail_path,
-                user_id=img.user_id,
-                uploaded_at=img.uploaded_at,
+        images = []
+        for img in db_images:
+            # Get metadata for each image
+            meta_statement = select(ImageMetadata).where(
+                ImageMetadata.image_id == img.id
             )
-            for img in db_images
-        ]
+            db_metadata = session.exec(meta_statement).first()
 
-        return ImagesPublic(data=images, count=total_count)
+            # Get tags and colors
+            tags, colors = get_image_tags_and_colors(session, img.id)
+
+            images.append(
+                ImageMetadataResponse(
+                    id=img.id,
+                    filename=img.filename,
+                    original_path=img.original_path,
+                    thumbnail_path=img.thumbnail_path,
+                    user_id=img.user_id,
+                    uploaded_at=img.uploaded_at,
+                    description=db_metadata.description if db_metadata else None,
+                    tags=tags if tags else None,
+                    colors=colors if colors else None,
+                    tag_vec=db_metadata.tag_vec if db_metadata else None,
+                    color_vec=db_metadata.color_vec if db_metadata else None,
+                    ai_processing_status=db_metadata.ai_processing_status if db_metadata else "pending",
+                )
+            )
+
+        page = skip // limit + 1 if limit > 0 else 1
+        return ImagesListResponse(
+            data=images,
+            count=len(images),
+            total=total_count,
+            page=page,
+            page_size=limit,
+        )
 
     except Exception as e:
         logger.error(f"List images error: {str(e)}")
@@ -358,16 +409,16 @@ async def delete_image(
         )
 
 
-@router.get("/public-url/{image_id}")
+@router.get("/public-url/{image_id}", response_model=ImagePublicResponse)
 async def get_public_url(
     image_id: str,
     session: SessionDep,
-) -> dict[str, str]:
+) -> ImagePublicResponse:
     """
-    Get public URL for an image (if bucket is public).
+    Get public URL for an image with metadata.
 
     - **image_id**: Image UUID
-    - Returns: Public URL to the image
+    - Returns: Public URL and image metadata
     """
     try:
         statement = select(Image).where(Image.id == UUID(image_id))
@@ -379,10 +430,30 @@ async def get_public_url(
                 detail="Image not found",
             )
 
+        # Get metadata
+        meta_statement = select(ImageMetadata).where(
+            ImageMetadata.image_id == UUID(image_id)
+        )
+        db_metadata = session.exec(meta_statement).first()
+
+        # Get tags and colors
+        tags, colors = get_image_tags_and_colors(session, UUID(image_id))
+
         # Construct public URL
         public_url = f"{settings.SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{db_image.original_path}"
 
-        return {"url": public_url, "filename": db_image.filename}
+        return ImagePublicResponse(
+            id=db_image.id,
+            filename=db_image.filename,
+            user_id=db_image.user_id,
+            uploaded_at=db_image.uploaded_at,
+            url=public_url,
+            description=db_metadata.description if db_metadata else None,
+            tags=tags if tags else None,
+            colors=colors if colors else None,
+            tag_vec=db_metadata.tag_vec if db_metadata else None,
+            color_vec=db_metadata.color_vec if db_metadata else None,
+        )
 
     except HTTPException:
         raise
