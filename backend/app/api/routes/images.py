@@ -8,14 +8,14 @@ from sqlmodel import select
 from app.api.deps import CurrentUser, SessionDep, SuperClient
 from app.core.config import settings
 from app.models.image import Image
-from app.models.image_metadata import ImageMetadata
 from app.models.image_colors import ImageColor
+from app.models.image_metadata import ImageMetadata
 from app.models.image_tags import ImageTag
 from app.schemas.image import (
     ImageMetadataResponse,
     ImagePublicResponse,
-    ImageUploadResponse,
     ImagesListResponse,
+    ImageUploadResponse,
 )
 from app.services.background_tasks import process_image_async
 
@@ -28,7 +28,9 @@ BUCKET_NAME = "images"
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 
-def get_image_tags_and_colors(session: any, image_id: UUID) -> tuple[list[str], list[str]]:
+def get_image_tags_and_colors(
+    session: any, image_id: UUID
+) -> tuple[list[str], list[str]]:
     """
     Fetch tags and colors for an image from relationship tables.
 
@@ -47,119 +49,143 @@ def get_image_tags_and_colors(session: any, image_id: UUID) -> tuple[list[str], 
     return tags, colors
 
 
-@router.post("/upload", response_model=ImageUploadResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/upload",
+    response_model=list[ImageUploadResponse] | ImageUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 async def upload_image(
     user: CurrentUser,
     session: SessionDep,
     client: SuperClient,
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-) -> ImageUploadResponse:
+    files: list[UploadFile] = File(...),
+) -> list[ImageUploadResponse] | ImageUploadResponse:
     """
-    Upload an image to Supabase Storage.
+    Upload one or more images to Supabase Storage.
 
-    - **file**: Image file (JPG, PNG, GIF, WebP)
-    - Returns: ImageUploadResponse with upload details
+    - **files**: Image file(s) (JPG, PNG, GIF, WebP)
+    - Can upload single file or multiple files
+    - Returns: Single ImageUploadResponse or list of responses
     - AI processing happens in background (don't block upload)
     """
     try:
-        # Validate file type
+        # Ensure files is always a list
+        if not isinstance(files, list):
+            files = [files]
+
         allowed_types = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-        if file.content_type not in allowed_types:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"File type {file.content_type} not allowed. Allowed: {', '.join(allowed_types)}",
-            )
+        responses = []
 
-        # Validate file size
-        content = await file.read()
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=status.HTTP_413_PAYLOAD_TOO_LARGE,
-                detail=f"File size exceeds {MAX_FILE_SIZE / 1024 / 1024}MB limit",
-            )
+        for file in files:
+            try:
+                # Validate file type
+                if file.content_type not in allowed_types:
+                    logger.warning(
+                        f"Invalid file type for {file.filename}: {file.content_type}"
+                    )
+                    continue
 
-        # Create unique file path
-        file_id = str(UUID(user.id))
+                # Validate file size
+                content = await file.read()
+                if len(content) > MAX_FILE_SIZE:
+                    logger.warning(
+                        f"File too large: {file.filename} ({len(content) / 1024 / 1024:.1f}MB)"
+                    )
+                    continue
 
-        # Generate unique filename to avoid conflicts
-        # Format: {original_name_without_ext}_{uuid4}.{ext}
-        file_path_obj = Path(file.filename)
-        unique_filename = f"{file_path_obj.stem}_{uuid4()}{file_path_obj.suffix}"
-        file_path = f"{file_id}/{unique_filename}"
+                # Create unique file path
+                file_id = str(UUID(user.id))
 
-        # Upload to Supabase Storage
-        try:
-            response = await client.storage.from_(BUCKET_NAME).upload(
-                path=file_path,
-                file=content,
-                file_options={"content-type": file.content_type},
-            )
-            logger.info(f"File uploaded: {file_path}")
-        except Exception as e:
-            logger.error(f"Storage upload error: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to upload file to storage",
-            )
+                # Generate unique filename to avoid conflicts
+                # Format: {original_name_without_ext}_{uuid4}.{ext}
+                file_path_obj = Path(file.filename)
+                unique_filename = (
+                    f"{file_path_obj.stem}_{uuid4()}{file_path_obj.suffix}"
+                )
+                file_path = f"{file_id}/{unique_filename}"
 
-        # Create database record
-        db_image = Image(
-            filename=file.filename,
-            original_path=file_path,
-            thumbnail_path=None,
-            user_id=UUID(user.id),
-        )
+                # Upload to Supabase Storage
+                try:
+                    response = await client.storage.from_(BUCKET_NAME).upload(
+                        path=file_path,
+                        file=content,
+                        file_options={"content-type": file.content_type},
+                    )
+                    logger.info(f"File uploaded: {file_path}")
+                except Exception as e:
+                    logger.error(f"Storage upload error for {file.filename}: {str(e)}")
+                    continue
 
-        session.add(db_image)
-        session.commit()
-        session.refresh(db_image)
+                # Create database record
+                db_image = Image(
+                    filename=file.filename,
+                    original_path=file_path,
+                    thumbnail_path=None,
+                    user_id=UUID(user.id),
+                )
 
-        logger.info(f"Image record created: {db_image.id}")
+                session.add(db_image)
+                session.commit()
+                session.refresh(db_image)
 
-        # Create initial metadata record with "pending" status
-        db_metadata = ImageMetadata(
-            image_id=db_image.id,
-            user_id=UUID(user.id),
-            ai_processing_status="pending",
-        )
+                logger.info(f"Image record created: {db_image.id}")
 
-        session.add(db_metadata)
-        session.commit()
-        session.refresh(db_metadata)
+                # Create initial metadata record with "pending" status
+                db_metadata = ImageMetadata(
+                    image_id=db_image.id,
+                    user_id=UUID(user.id),
+                    ai_processing_status="pending",
+                )
 
-        logger.info(f"Image metadata created: {db_metadata.id} with status=pending")
+                session.add(db_metadata)
+                session.commit()
+                session.refresh(db_metadata)
 
-        # Schedule async image processing in background
-        # Don't wait for it - return immediately to user
-        try:
-            res = await client.storage.from_("images").create_signed_url(file_path, 600)
-            signed_url = res["signedURL"]
+                logger.info(
+                    f"Image metadata created: {db_metadata.id} with status=pending"
+                )
 
-            background_tasks.add_task(
-                process_image_async,
-                image_id=db_image.id,
-                file_path=file_path,
-                user_id=UUID(user.id),
-                signed_url=signed_url,
-            )
-            logger.info(f"Scheduled async processing for image {db_image.id}")
+                # Schedule async image processing in background
+                try:
+                    res = await client.storage.from_("images").create_signed_url(
+                        file_path, 600
+                    )
+                    signed_url = res["signedURL"]
 
-        except Exception as e:
-            logger.warning(f"Could not schedule AI processing: {str(e)}")
-            # Continue anyway - image is uploaded, just won't have AI metadata
+                    background_tasks.add_task(
+                        process_image_async,
+                        image_id=db_image.id,
+                        file_path=file_path,
+                        user_id=UUID(user.id),
+                        signed_url=signed_url,
+                    )
+                    logger.info(f"Scheduled async processing for image {db_image.id}")
 
-        return ImageUploadResponse(
-            id=db_image.id,
-            filename=db_image.filename,
-            original_path=db_image.original_path,
-            user_id=db_image.user_id,
-            uploaded_at=db_image.uploaded_at,
-            ai_processing_status="pending",
-        )
+                except Exception as e:
+                    logger.warning(f"Could not schedule AI processing: {str(e)}")
+                    # Continue anyway - image is uploaded, just won't have AI metadata
 
-    except HTTPException:
-        raise
+                responses.append(
+                    ImageUploadResponse(
+                        id=db_image.id,
+                        filename=db_image.filename,
+                        original_path=db_image.original_path,
+                        user_id=db_image.user_id,
+                        uploaded_at=db_image.uploaded_at,
+                        ai_processing_status="pending",
+                    )
+                )
+
+            except Exception as e:
+                logger.error(f"Error uploading {file.filename}: {str(e)}")
+                continue
+
+        # Return single response or list based on input
+        if len(responses) == 1:
+            return responses[0]
+        return responses
+
     except Exception as e:
         logger.error(f"Upload error: {str(e)}")
         raise HTTPException(
@@ -209,7 +235,9 @@ async def get_image(
             colors=colors if colors else None,
             tag_vec=db_metadata.tag_vec if db_metadata else None,
             color_vec=db_metadata.color_vec if db_metadata else None,
-            ai_processing_status=db_metadata.ai_processing_status if db_metadata else "pending",
+            ai_processing_status=(
+                db_metadata.ai_processing_status if db_metadata else "pending"
+            ),
         )
 
     except HTTPException:
@@ -275,7 +303,9 @@ async def list_images(
                     colors=colors if colors else None,
                     tag_vec=db_metadata.tag_vec if db_metadata else None,
                     color_vec=db_metadata.color_vec if db_metadata else None,
-                    ai_processing_status=db_metadata.ai_processing_status if db_metadata else "pending",
+                    ai_processing_status=(
+                        db_metadata.ai_processing_status if db_metadata else "pending"
+                    ),
                 )
             )
 
