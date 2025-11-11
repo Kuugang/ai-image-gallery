@@ -10,6 +10,14 @@ from app.core.config import settings
 from app.schemas.auth import UserIn
 
 
+class TokenExpiredException(Exception):
+    """Raised when JWT token is expired or invalid"""
+
+    def __init__(self, message: str = "Token expired or invalid"):
+        self.message = message
+        super().__init__(self.message)
+
+
 async def get_super_client() -> AsyncClient:
     """for validation access_token init at life span event"""
     super_client = await create_client(
@@ -36,8 +44,14 @@ TokenDep = Annotated[str, Depends(reusable_oauth2)]
 
 async def get_current_user(token: TokenDep, super_client: SuperClient) -> UserIn:
     """get current user from token and  validate same time"""
-    user_rsp = await super_client.auth.get_user(jwt=token)
-    if not user_rsp:
-        logging.error("User not found")
-        raise HTTPException(status_code=404, detail="User not found")
-    return UserIn(**user_rsp.user.model_dump(), access_token=token)
+    try:
+        user_rsp = await super_client.auth.get_user(jwt=token)
+        if not user_rsp:
+            logging.error("User not found")
+            raise TokenExpiredException("User not found")
+        return UserIn(**user_rsp.user.model_dump(), access_token=token)
+    except TokenExpiredException:
+        raise
+    except Exception as e:
+        logging.error(f"Auth error: {str(e)}")
+        raise TokenExpiredException(f"Authentication failed: {str(e)}")

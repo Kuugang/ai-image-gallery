@@ -3,12 +3,14 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.concurrency import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from uvicorn.config import LOGGING_CONFIG
 
 from app.api.main import api_router
+from app.core.auth import TokenExpiredException
 from app.core.config import settings
 from app.utils import custom_generate_unique_id
 
@@ -32,6 +34,16 @@ app = FastAPI(
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     generate_unique_id_function=custom_generate_unique_id,
 )
+
+
+# Global exception handler for token/auth errors
+@app.exception_handler(TokenExpiredException)
+async def token_expired_exception_handler(request: Request, exc: TokenExpiredException):
+    """Handle expired or invalid JWT tokens"""
+    return JSONResponse(
+        status_code=401,
+        content={"detail": exc.message},
+    )
 
 
 # Set all CORS enabled origins
