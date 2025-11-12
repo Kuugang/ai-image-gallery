@@ -10,7 +10,16 @@ class Color(SQLModel, table=True):
 
 class ImageColor(SQLModel, table=True):
     __tablename__ = "image_colors"
-    image_id: str = Field(sa_column=Column(ForeignKey("images.id"), primary_key=True))
+    image_id: str = Field(
+        sa_column=Column(
+            ForeignKey(
+                "images.id",
+                onupdate="CASCADE",
+                ondelete="CASCADE",
+            ),
+            primary_key=True,
+        ),
+    )
     color_hex: str = Field(
         sa_column=Column(CITEXT(), ForeignKey("colors.hex"), primary_key=True)
     )

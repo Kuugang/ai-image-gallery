@@ -33,11 +33,23 @@ class ImageMetadata(InDBBase, ImageMetadataBase, table=True):
     __tablename__ = "image_metadata"
 
     image_id: uuid.UUID = Field(
-        sa_column=Column(ForeignKey("images.id", ondelete="CASCADE"), nullable=False)
+        sa_column=Column(
+            ForeignKey(
+                "images.id",
+                ondelete="CASCADE",
+                onupdate="CASCADE",
+            ),
+            nullable=False,
+        )
     )
     user_id: uuid.UUID = Field(
         sa_column=Column(
-            ForeignKey("auth.users.id", ondelete="CASCADE"), nullable=False
+            ForeignKey(
+                "auth.users.id",
+                ondelete="CASCADE",
+                onupdate="CASCADE",
+            ),
+            nullable=False,
         )
     )
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

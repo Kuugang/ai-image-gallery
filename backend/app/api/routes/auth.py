@@ -1,10 +1,11 @@
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from supabase._async.client import AsyncClient
 
 from app.core.auth import SuperClient, TokenDep, get_super_client
+from app.core.cookies import clear_auth_cookies, set_auth_cookies
 from app.schemas.auth import (
     LoginRequest,
     PasswordResetRequest,
@@ -14,42 +15,59 @@ from app.schemas.auth import (
     UpdatePasswordRequest,
     UserOut,
 )
+from app.schemas.response import ApiResponse
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-@router.post("/signup", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+@router.post("/signup", response_model=ApiResponse[UserOut], status_code=status.HTTP_201_CREATED)
 async def signup(
     user_data: SignupRequest,
     client: SuperClient,
-) -> UserOut:
+    response: Response,
+) -> ApiResponse[UserOut]:
     """
     Create a new user account via Supabase Auth.
+
+    Sets authentication cookies on success.
 
     - **email**: User email address
     - **password**: User password (min 6 characters)
     """
     try:
-        response = await client.auth.sign_up(
+        resp = await client.auth.sign_up(
             {
                 "email": user_data.email,
                 "password": user_data.password,
             }
         )
 
-        if not response or not response.user:
+        if not resp or not resp.user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Failed to create user",
             )
 
-        return UserOut(
-            access_token=response.session.access_token if response.session else None,
-            refresh_token=response.session.refresh_token if response.session else None,
-            user_id=response.user.id,
-            email=response.user.email,
+        user_out = UserOut(
+            access_token=resp.session.access_token if resp.session else None,
+            refresh_token=resp.session.refresh_token if resp.session else None,
+            user_id=resp.user.id,
+            email=resp.user.email,
+        )
+
+        # Set auth cookies if session exists
+        if resp.session:
+            set_auth_cookies(
+                response,
+                access_token=resp.session.access_token,
+                refresh_token=resp.session.refresh_token,
+            )
+
+        return ApiResponse(
+            data=user_out,
+            message="User account created successfully. Please confirm your email."
         )
 
     except Exception as e:
@@ -60,36 +78,51 @@ async def signup(
         )
 
 
-@router.post("/login", response_model=UserOut)
+@router.post("/login", response_model=ApiResponse[UserOut])
 async def login(
     credentials: LoginRequest,
     client: SuperClient,
-) -> UserOut:
+    response: Response,
+) -> ApiResponse[UserOut]:
     """
     Login with email and password.
+
+    Sets authentication cookies on success.
 
     - **email**: User email address
     - **password**: User password
     """
     try:
-        response = await client.auth.sign_in_with_password(
+        resp = await client.auth.sign_in_with_password(
             {
                 "email": credentials.email,
                 "password": credentials.password,
             }
         )
 
-        if not response or not response.user or not response.session:
+        if not resp or not resp.user or not resp.session:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials",
             )
 
-        return UserOut(
-            access_token=response.session.access_token,
-            refresh_token=response.session.refresh_token,
-            user_id=response.user.id,
-            email=response.user.email,
+        user_out = UserOut(
+            access_token=resp.session.access_token,
+            refresh_token=resp.session.refresh_token,
+            user_id=resp.user.id,
+            email=resp.user.email,
+        )
+
+        # Set auth cookies
+        set_auth_cookies(
+            response,
+            access_token=resp.session.access_token,
+            refresh_token=resp.session.refresh_token,
+        )
+
+        return ApiResponse(
+            data=user_out,
+            message="Login successful"
         )
 
     except Exception as e:
@@ -109,14 +142,19 @@ async def login(
 async def logout(
     token: TokenDep,
     client: SuperClient,
+    response: Response,
 ) -> None:
     """
     Logout the current user by revoking their session.
+
+    Clears authentication cookies.
 
     Requires a valid JWT token in the Authorization header.
     """
     try:
         await client.auth.sign_out(jwt=token)
+        # Clear auth cookies
+        clear_auth_cookies(response)
     except Exception as e:
         logger.error(f"Logout error: {str(e)}")
         raise HTTPException(
@@ -125,28 +163,43 @@ async def logout(
         )
 
 
-@router.post("/refresh", response_model=Token)
+@router.post("/refresh", response_model=ApiResponse[Token])
 async def refresh_token(
     refresh_data: RefreshTokenRequest,
     client: SuperClient,
-) -> Token:
+    response: Response,
+) -> ApiResponse[Token]:
     """
     Refresh an expired access token using a refresh token.
+
+    Sets new authentication cookies on success.
 
     - **refresh_token**: Valid refresh token from login/signup
     """
     try:
-        response = await client.auth.refresh_session(refresh_data.refresh_token)
+        resp = await client.auth.refresh_session(refresh_data.refresh_token)
 
-        if not response or not response.session:
+        if not resp or not resp.session:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid refresh token",
             )
 
-        return Token(
-            access_token=response.session.access_token,
-            refresh_token=response.session.refresh_token,
+        token = Token(
+            access_token=resp.session.access_token,
+            refresh_token=resp.session.refresh_token,
+        )
+
+        # Set new auth cookies
+        set_auth_cookies(
+            response,
+            access_token=resp.session.access_token,
+            refresh_token=resp.session.refresh_token,
+        )
+
+        return ApiResponse(
+            data=token,
+            message="Token refreshed successfully"
         )
 
     except Exception as e:
@@ -157,11 +210,11 @@ async def refresh_token(
         )
 
 
-@router.post("/password-reset", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/password-reset", status_code=status.HTTP_202_ACCEPTED, response_model=ApiResponse)
 async def request_password_reset(
     reset_data: PasswordResetRequest,
     client: SuperClient,
-) -> dict[str, str]:
+) -> ApiResponse:
     """
     Request a password reset email.
 
@@ -172,19 +225,23 @@ async def request_password_reset(
     try:
         await client.auth.reset_password_for_email(reset_data.email)
 
-        return {"message": "Password reset email sent. Please check your email."}
+        return ApiResponse(
+            message="Password reset email sent. Please check your email."
+        )
 
     except Exception as e:
         logger.error(f"Password reset request error: {str(e)}")
         # Don't reveal if email exists or not for security
-        return {"message": "If an account exists, a password reset email will be sent."}
+        return ApiResponse(
+            message="If an account exists, a password reset email will be sent."
+        )
 
 
-@router.post("/update-password", status_code=status.HTTP_200_OK)
+@router.post("/update-password", status_code=status.HTTP_200_OK, response_model=ApiResponse)
 async def update_password(
     update_data: UpdatePasswordRequest,
     client: SuperClient,
-) -> dict[str, str]:
+) -> ApiResponse:
     """
     Update user password with a valid access token.
 
@@ -204,7 +261,9 @@ async def update_password(
             jwt=update_data.access_token,
         )
 
-        return {"message": "Password updated successfully"}
+        return ApiResponse(
+            message="Password updated successfully"
+        )
 
     except HTTPException:
         raise
@@ -216,11 +275,11 @@ async def update_password(
         )
 
 
-@router.get("/me", response_model=UserOut)
+@router.get("/me", response_model=ApiResponse[UserOut])
 async def get_current_user_info(
     token: TokenDep,
     client: SuperClient,
-) -> UserOut:
+) -> ApiResponse[UserOut]:
     """
     Get the current user information from their access token.
 
@@ -235,10 +294,15 @@ async def get_current_user_info(
                 detail="Invalid token",
             )
 
-        return UserOut(
+        user_out = UserOut(
             access_token=token,
             user_id=response.user.id,
             email=response.user.email,
+        )
+
+        return ApiResponse(
+            data=user_out,
+            message="User info retrieved successfully"
         )
 
     except HTTPException:

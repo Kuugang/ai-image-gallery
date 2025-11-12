@@ -1,5 +1,6 @@
 """Background tasks for image processing."""
 
+import asyncio
 import logging
 from uuid import UUID
 
@@ -170,3 +171,21 @@ async def process_image_async(
                     session.commit()
         except Exception as e2:
             logger.error(f"Error updating metadata status: {str(e2)}")
+
+
+def process_image_background(
+    image_id: UUID,
+    file_path: str,
+    user_id: UUID,
+    signed_url: str,
+) -> None:
+    """Sync wrapper for async image processing to work with BackgroundTasks."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    loop.run_until_complete(
+        process_image_async(image_id, file_path, user_id, signed_url)
+    )

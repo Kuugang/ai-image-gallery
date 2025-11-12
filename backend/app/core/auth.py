@@ -1,8 +1,7 @@
 import logging
 from typing import Annotated
 
-from fastapi import Depends, HTTPException
-from fastapi.security import OAuth2PasswordBearer
+from fastapi import Cookie, Depends, HTTPException
 from supabase import AsyncClientOptions
 from supabase._async.client import AsyncClient, create_client
 
@@ -35,15 +34,19 @@ async def get_super_client() -> AsyncClient:
 SuperClient = Annotated[AsyncClient, Depends(get_super_client)]
 
 
-# auto get token from header
-reusable_oauth2 = OAuth2PasswordBearer(
-    tokenUrl=f"{settings.API_V1_STR}/login/access-token"
-)
-TokenDep = Annotated[str, Depends(reusable_oauth2)]
+# get token from cookies
+def get_token_from_cookie(access_token: str | None = Cookie(None)) -> str:
+    """Extract access token from cookie"""
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Access token not found")
+    return access_token
+
+
+TokenDep = Annotated[str, Depends(get_token_from_cookie)]
 
 
 async def get_current_user(token: TokenDep, super_client: SuperClient) -> UserIn:
-    """get current user from token and  validate same time"""
+    """get current user from token and validate same time"""
     try:
         user_rsp = await super_client.auth.get_user(jwt=token)
         if not user_rsp:

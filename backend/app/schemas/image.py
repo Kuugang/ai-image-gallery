@@ -40,14 +40,19 @@ class ImageMetadataResponse(BaseModel):
         from_attributes = True
 
 
-class ImagesListResponse(BaseModel):
-    """Paginated list of images."""
+class PaginatedImagesResponse(BaseModel):
+    """Paginated list of images with standardized response format."""
 
     data: list[ImageMetadataResponse]
-    count: int
-    total: int
-    page: int
-    page_size: int
+    count: int  # Items in current page
+    total: int  # Total items available
+    page: int  # Current page number
+    page_size: int  # Items per page
+    message: str = "Images retrieved successfully"
+
+
+# Legacy alias for backward compatibility
+ImagesListResponse = PaginatedImagesResponse
 
 
 class ImagePublicResponse(BaseModel):

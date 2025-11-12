@@ -14,7 +14,16 @@ class Tag(SQLModel, table=True):
 class ImageTag(SQLModel, table=True):
     __tablename__ = "image_tags"
 
-    image_id: str = Field(sa_column=Column(ForeignKey("images.id"), primary_key=True))
+    image_id: str = Field(
+        sa_column=Column(
+            ForeignKey(
+                "images.id",
+                onupdate="CASCADE",
+                ondelete="CASCADE",
+            ),
+            primary_key=True,
+        ),
+    )
     tag_name: str = Field(
         sa_column=Column(CITEXT(), ForeignKey("tags.name"), primary_key=True)
     )

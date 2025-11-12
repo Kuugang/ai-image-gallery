@@ -27,6 +27,7 @@ from app.schemas.image import (
     ImagesListResponse,
     ImageUploadResponse,
 )
+from app.schemas.response import ApiResponse
 from app.services.background_tasks import process_image_async
 from app.utils.vectors import color_query_one_hot, color_vector, tag_vector
 
@@ -62,7 +63,7 @@ def get_image_tags_and_colors(
 
 @router.post(
     "/upload",
-    response_model=list[ImageUploadResponse] | ImageUploadResponse,
+    response_model=ApiResponse[list[ImageUploadResponse] | ImageUploadResponse],
     status_code=status.HTTP_201_CREATED,
 )
 async def upload_image(
@@ -71,13 +72,13 @@ async def upload_image(
     client: SuperClient,
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
-) -> list[ImageUploadResponse] | ImageUploadResponse:
+) -> ApiResponse[list[ImageUploadResponse] | ImageUploadResponse]:
     """
     Upload one or more images to Supabase Storage.
 
     - **files**: Image file(s) (JPG, PNG, GIF, WebP)
     - Can upload single file or multiple files
-    - Returns: Single ImageUploadResponse or list of responses
+    - Returns: Wrapped response with uploaded image metadata
     - AI processing happens in background (don't block upload)
     """
     try:
@@ -194,8 +195,10 @@ async def upload_image(
 
         # Return single response or list based on input
         if len(responses) == 1:
-            return responses[0]
-        return responses
+            return ApiResponse(data=responses[0], message="Image uploaded successfully")
+        return ApiResponse(
+            data=responses, message=f"{len(responses)} images uploaded successfully"
+        )
 
     except Exception as e:
         logger.error(f"Upload error: {str(e)}")
@@ -205,11 +208,11 @@ async def upload_image(
         )
 
 
-@router.get("/{image_id}", response_model=ImageMetadataResponse)
+@router.get("/{image_id}", response_model=ApiResponse[ImageMetadataResponse])
 async def get_image(
     image_id: str,
     session: SessionDep,
-) -> ImageMetadataResponse:
+) -> ApiResponse[ImageMetadataResponse]:
     """
     Get image details by ID with AI metadata.
 
@@ -234,7 +237,7 @@ async def get_image(
         # Get tags and colors
         tags, colors = get_image_tags_and_colors(session, UUID(image_id))
 
-        return ImageMetadataResponse(
+        response_data = ImageMetadataResponse(
             id=db_image.id,
             filename=db_image.filename,
             original_path=db_image.original_path,
@@ -250,6 +253,8 @@ async def get_image(
                 db_metadata.ai_processing_status if db_metadata else "pending"
             ),
         )
+
+        return ApiResponse(data=response_data, message="Image retrieved successfully")
 
     except HTTPException:
         raise
@@ -297,7 +302,7 @@ async def get_images(
         # Handle tag and/or description filtering
         tag_matched_ids = None
         desc_matched_ids = None
-        color_scored_images = None
+        color_matched_ids = None
 
         # Search by tag name(s)
         if tag_list:
@@ -330,10 +335,11 @@ async def get_images(
 
         # Handle color filter
         if color_list:
-            # Get all user's images with color vectors
+            # Get all user's images with metadata and colors
             all_images_query = (
-                select(Image, ImageMetadata)
+                select(Image, ImageMetadata, ImageColor)
                 .join(ImageMetadata, Image.id == ImageMetadata.image_id)
+                .outerjoin(ImageColor, Image.id == ImageColor.image_id)
                 .where(Image.user_id == user_uuid)
             )
             result = session.exec(all_images_query)
@@ -348,7 +354,7 @@ async def get_images(
                     query_vec_np = np.array(query_vec, dtype=np.float32)
 
                     for row in rows:
-                        img, metadata = row[0], row[1]
+                        img, metadata, color = row[0], row[1], row[2]
                         if metadata.color_vec is not None:
                             stored_vec = np.array(metadata.color_vec, dtype=np.float32)
                             # Use a threshold to determine if colors match
@@ -435,7 +441,8 @@ async def get_images(
             items = []
             for img in db_images:
                 # Get metadata
-                db_metadata = session.get(ImageMetadata, img.id)
+                meta_query = select(ImageMetadata).where(ImageMetadata.image_id == img.id)
+                db_metadata = session.exec(meta_query).first()
 
                 # Get tags and colors
                 tags, colors_list = get_image_tags_and_colors(session, img.id)
@@ -491,7 +498,8 @@ async def get_images(
             items = []
             for img in db_images:
                 # Get metadata
-                db_metadata = session.get(ImageMetadata, img.id)
+                meta_query = select(ImageMetadata).where(ImageMetadata.image_id == img.id)
+                db_metadata = session.exec(meta_query).first()
 
                 # Get tags and colors
                 tags, colors_list = get_image_tags_and_colors(session, img.id)
@@ -573,10 +581,11 @@ async def get_similar_images(
         tag_list = [t.strip() for t in tag.split(",")] if tag else None
         color_list = [c.strip() for c in color.split(",")] if color else None
 
-        # Get all user's images with metadata
+        # Get all user's images with metadata and colors
         all_images_query = (
-            select(Image, ImageMetadata)
+            select(Image, ImageMetadata, ImageColor)
             .join(ImageMetadata, Image.id == ImageMetadata.image_id)
+            .outerjoin(ImageColor, Image.id == ImageColor.image_id)
             .where(Image.user_id == user_uuid)
         )
         result = session.exec(all_images_query)
@@ -595,7 +604,7 @@ async def get_similar_images(
         image_scores = []
 
         for row in rows:
-            img, metadata = row[0], row[1]
+            img, metadata, color = row[0], row[1], row[2]
 
             # Skip images without tag vectors
             if metadata.tag_vec is None:
