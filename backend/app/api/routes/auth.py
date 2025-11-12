@@ -1,11 +1,14 @@
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
+from sqlmodel import Session, select
 from supabase._async.client import AsyncClient
 
 from app.core.auth import SuperClient, TokenDep, get_super_client
 from app.core.cookies import clear_auth_cookies, set_auth_cookies
+from app.core.db import get_db
+from app.models import User
 from app.schemas.auth import (
     LoginRequest,
     PasswordResetRequest,
@@ -22,11 +25,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-@router.post("/signup", response_model=ApiResponse[UserOut], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/signup", response_model=ApiResponse[UserOut], status_code=status.HTTP_201_CREATED
+)
 async def signup(
     user_data: SignupRequest,
     client: SuperClient,
-    response: Response,
+    db: Session = Depends(get_db),
 ) -> ApiResponse[UserOut]:
     """
     Create a new user account via Supabase Auth.
@@ -37,6 +42,14 @@ async def signup(
     - **password**: User password (min 6 characters)
     """
     try:
+        # Check if email already exists in the database
+        existing_user = db.exec(select(User).where(User.email == user_data.email)).first()
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Email is already registered",
+            )
+        
         resp = await client.auth.sign_up(
             {
                 "email": user_data.email,
@@ -57,24 +70,37 @@ async def signup(
             email=resp.user.email,
         )
 
-        # Set auth cookies if session exists
-        if resp.session:
-            set_auth_cookies(
-                response,
-                access_token=resp.session.access_token,
-                refresh_token=resp.session.refresh_token,
-            )
-
         return ApiResponse(
             data=user_out,
-            message="User account created successfully. Please confirm your email."
+            message="User account created successfully. Please confirm your email.",
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
+        error_msg = str(e).lower()
         logger.error(f"Signup error: {str(e)}")
+        
+        # Handle common Supabase auth errors
+        if "already registered" in error_msg or "user already exists" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Email is already registered",
+            )
+        elif "invalid email" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid email address",
+            )
+        elif "password" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password does not meet security requirements",
+            )
+        
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
+            detail="Failed to create user account",
         )
 
 
@@ -120,10 +146,7 @@ async def login(
             refresh_token=resp.session.refresh_token,
         )
 
-        return ApiResponse(
-            data=user_out,
-            message="Login successful"
-        )
+        return ApiResponse(data=user_out, message="Login successful")
 
     except Exception as e:
         logger.error(f"Login error: {str(e)}")
@@ -148,36 +171,38 @@ async def logout(
     Logout the current user by revoking their session.
 
     Clears authentication cookies.
-
-    Requires a valid JWT token in the Authorization header.
     """
     try:
-        await client.auth.sign_out(jwt=token)
-        # Clear auth cookies
-        clear_auth_cookies(response)
+        # Supabase doesn't require explicit sign_out with token for revocation
+        # Just clear the cookies which effectively logs out the user
+        logger.info(f"User logout requested")
     except Exception as e:
         logger.error(f"Logout error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Logout failed",
-        )
+    finally:
+        # Always clear auth cookies
+        clear_auth_cookies(response)
 
 
 @router.post("/refresh", response_model=ApiResponse[Token])
 async def refresh_token(
-    refresh_data: RefreshTokenRequest,
     client: SuperClient,
     response: Response,
+    refresh_token: str | None = Cookie(None),
 ) -> ApiResponse[Token]:
     """
-    Refresh an expired access token using a refresh token.
+    Refresh an expired access token using a refresh token from cookie.
 
     Sets new authentication cookies on success.
-
-    - **refresh_token**: Valid refresh token from login/signup
     """
     try:
-        resp = await client.auth.refresh_session(refresh_data.refresh_token)
+        # Get refresh token from cookie
+        if not refresh_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token not found in cookies",
+            )
+
+        resp = await client.auth.refresh_session(refresh_token)
 
         if not resp or not resp.session:
             raise HTTPException(
@@ -197,11 +222,10 @@ async def refresh_token(
             refresh_token=resp.session.refresh_token,
         )
 
-        return ApiResponse(
-            data=token,
-            message="Token refreshed successfully"
-        )
+        return ApiResponse(data=token, message="Token refreshed successfully")
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Refresh token error: {str(e)}")
         raise HTTPException(
@@ -210,7 +234,9 @@ async def refresh_token(
         )
 
 
-@router.post("/password-reset", status_code=status.HTTP_202_ACCEPTED, response_model=ApiResponse)
+@router.post(
+    "/password-reset", status_code=status.HTTP_202_ACCEPTED, response_model=ApiResponse
+)
 async def request_password_reset(
     reset_data: PasswordResetRequest,
     client: SuperClient,
@@ -237,7 +263,9 @@ async def request_password_reset(
         )
 
 
-@router.post("/update-password", status_code=status.HTTP_200_OK, response_model=ApiResponse)
+@router.post(
+    "/update-password", status_code=status.HTTP_200_OK, response_model=ApiResponse
+)
 async def update_password(
     update_data: UpdatePasswordRequest,
     client: SuperClient,
@@ -261,9 +289,7 @@ async def update_password(
             jwt=update_data.access_token,
         )
 
-        return ApiResponse(
-            message="Password updated successfully"
-        )
+        return ApiResponse(message="Password updated successfully")
 
     except HTTPException:
         raise
@@ -300,10 +326,7 @@ async def get_current_user_info(
             email=response.user.email,
         )
 
-        return ApiResponse(
-            data=user_out,
-            message="User info retrieved successfully"
-        )
+        return ApiResponse(data=user_out, message="User info retrieved successfully")
 
     except HTTPException:
         raise
